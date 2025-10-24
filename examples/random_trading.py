@@ -10,8 +10,22 @@ from rich.console import Console
 from rich.table import Table
 from rich.live import Live
 from rich.layout import Layout
+import ssl
 
-logging.basicConfig(level=logging.INFO)
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('trading_debug.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+
+# 配置SSL上下文，减少SSL错误
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
 
 BASE_URL = "https://mainnet.zklighter.elliot.ai"
 
@@ -109,12 +123,54 @@ async def get_account_balance(account_info):
             except:
                 pass
 
+async def get_account_volume(account_info):
+    """获取账户交易量"""
+    api_client = None
+    try:
+        # 创建独立的ApiClient来获取账户信息
+        api_client = lighter.ApiClient(configuration=lighter.Configuration(host=BASE_URL))
+        
+        # 使用AccountApi获取真实账户信息
+        from lighter.api.account_api import AccountApi
+        account_api = AccountApi(api_client)
+        
+        # 通过账户索引获取账户信息
+        account_data = await account_api.account(
+            by="index", 
+            value=str(account_info['account_index'])
+        )
+        
+        # 提取账户信息
+        if hasattr(account_data, 'accounts') and account_data.accounts:
+            account = account_data.accounts[0]  # 获取第一个账户
+            
+            # 使用total_asset_value作为交易量
+            total_asset_value = getattr(account, 'total_asset_value', 0)
+            if total_asset_value and total_asset_value != 0:
+                if isinstance(total_asset_value, str):
+                    total_asset_value = float(total_asset_value)
+                return f"{total_asset_value:.2f} USDC"
+            else:
+                return "0.00 USDC"
+        else:
+            return "未找到"
+            
+    except Exception as e:
+        return f"获取失败: {str(e)[:20]}..."
+    finally:
+        if api_client:
+            try:
+                await api_client.close()
+            except:
+                pass
+
 def create_status_table(accounts):
     """创建状态表格"""
     table = Table(title="账户交易状态", show_header=True, header_style="bold green")
     table.add_column("账户", style="bold white", no_wrap=True)
     table.add_column("余额", style="bold white")
     table.add_column("循环次数", style="bold white")
+    table.add_column("交易量", style="bold white")
     table.add_column("状态", style="bold white")
     
     for account in accounts:
@@ -126,16 +182,30 @@ def create_status_table(accounts):
             account['description'],
             account_status.get(f"{account_key}_balance", "获取中..."),
             str(loop_count),
+            account_status.get(f"{account_key}_volume", "获取中..."),
             status
         )
     
     return table
 
-def update_account_status(account_info, balance, status):
+def update_account_status(account_info, balance, status, volume=None):
     """更新账户状态"""
     account_key = f"{account_info['description']}_{account_info['account_index']}"
     account_status[f"{account_key}_balance"] = balance
     account_status[account_key] = status
+    if volume is not None:
+        account_status[f"{account_key}_volume"] = volume
+
+async def retry_operation(operation, max_retries=3, delay=1):
+    """重试机制"""
+    for attempt in range(max_retries):
+        try:
+            return await operation()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise e
+            logging.warning(f"操作失败，第{attempt + 1}次重试: {e}")
+            await asyncio.sleep(delay * (attempt + 1))
 
 async def create_orders_like_original(client, account_info, loop_count):
     """按照原始脚本逻辑创建买单和卖单"""
@@ -182,10 +252,11 @@ async def create_orders_like_original(client, account_info, loop_count):
     except Exception as e:
         save_trading_log(account_info, "卖单", f"异常: {e}", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     
-    # 如果买卖都成功，查询账户余额
+    # 如果买卖都成功，查询账户余额和交易额
     if buy_success and sell_success:
         balance = await get_account_balance(account_info)
-        update_account_status(account_info, balance, "交易成功")
+        volume = await get_account_volume(account_info)
+        update_account_status(account_info, balance, "交易成功", volume)
     else:
         update_account_status(account_info, "获取失败", "交易失败")
 
@@ -203,6 +274,7 @@ async def main():
         account_key = f"{account['description']}_{account['account_index']}"
         account_status[account_key] = "等待中"
         account_status[f"{account_key}_balance"] = "获取中..."
+        account_status[f"{account_key}_volume"] = "获取中..."
     
     try:
         with Live(create_status_table(accounts), refresh_per_second=4) as live:
@@ -221,16 +293,31 @@ async def main():
                 )
                 
                 # 检查客户端
-                err = client.check_client()
-                if err is not None:
-                    update_account_status(selected_account, "连接失败", "连接失败")
-                    await client.close()
+                try:
+                    err = client.check_client()
+                    if err is not None:
+                        update_account_status(selected_account, "连接失败", "连接失败")
+                        await client.close()
+                        live.update(create_status_table(accounts))
+                        await asyncio.sleep(2.5)
+                        continue
+                except Exception as e:
+                    logging.error(f"客户端检查异常: {e}")
+                    update_account_status(selected_account, "连接异常", "连接异常")
+                    try:
+                        await client.close()
+                    except:
+                        pass
                     live.update(create_status_table(accounts))
                     await asyncio.sleep(2.5)
                     continue
                 
                 # 创建买单和卖单（按照原始脚本逻辑）
-                await create_orders_like_original(client, selected_account, loop_count)
+                try:
+                    await retry_operation(lambda: create_orders_like_original(client, selected_account, loop_count))
+                except Exception as e:
+                    logging.error(f"交易执行异常: {e}")
+                    update_account_status(selected_account, "交易异常", "交易异常")
                 
                 # 创建认证令牌
                 try:
@@ -238,10 +325,14 @@ async def main():
                     if err is not None:
                         update_account_status(selected_account, "认证失败", "认证失败")
                 except Exception as e:
+                    logging.error(f"认证令牌异常: {e}")
                     update_account_status(selected_account, "认证异常", "认证异常")
                 
                 # 关闭客户端
-                await client.close()
+                try:
+                    await client.close()
+                except Exception as e:
+                    logging.error(f"关闭客户端异常: {e}")
                 
                 # 更新表格显示
                 live.update(create_status_table(accounts))
