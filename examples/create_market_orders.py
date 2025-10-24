@@ -46,7 +46,7 @@ async def main():
             tx = await client.create_market_order_limited_slippage(
                 market_index=1,  # BTC/USDC 市场索引
                 client_order_index=100 + loop_count,  # 动态索引，避免重复
-                base_amount=50,  # 0.01 BTC = 1000 最小单位
+                base_amount=100,  # 0.01 BTC = 1000 最小单位
                 max_slippage=0.05,  # 最大滑点5%
                 is_ask=False,  # 买单
                 # ideal_price=None,  # 不设置理想价格，让系统自动获取当前市场价格
@@ -62,7 +62,7 @@ async def main():
             tx = await client.create_market_order_limited_slippage(
                 market_index=1,  # BTC/USDC 市场索引
                 client_order_index=200 + loop_count,  # 动态索引，避免重复
-                base_amount=50,  # 0.01 BTC = 1000 最小单位
+                base_amount=100,  # 0.01 BTC = 1000 最小单位
                 max_slippage=0.05,  # 最大滑点5%
                 is_ask=True,  # 卖单
                 # ideal_price=None,  # 不设置理想价格，让系统自动获取当前市场价格
