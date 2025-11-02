@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import asyncio
 import logging
 import lighter
@@ -222,7 +223,7 @@ async def create_orders_like_original(client, account_info, loop_count):
         tx = await client.create_market_order_limited_slippage(
             market_index=1,  # BTC/USDC 市场索引
             client_order_index=100 + loop_count,  # 动态索引，避免重复
-            base_amount=100,  # 0.01 BTC = 100 最小单位
+            base_amount=100,  # 0.001 BTC = 100 最小单位
             max_slippage=0.05,  # 最大滑点5%
             is_ask=False,  # 买单
         )
@@ -299,7 +300,7 @@ async def main():
                         update_account_status(selected_account, "连接失败", "连接失败")
                         await client.close()
                         live.update(create_status_table(accounts))
-                        await asyncio.sleep(2.5)
+                        await asyncio.sleep(8)
                         continue
                 except Exception as e:
                     logging.error(f"客户端检查异常: {e}")

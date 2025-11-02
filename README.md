@@ -1,198 +1,291 @@
-# Lighter Python
+# Backpack Exchange Python SDK
 
-Python SDK for Lighter
+A comprehensive Python SDK for the Backpack Exchange API, providing both REST and WebSocket functionality for trading and market data access.
 
-## Requirements.
+## Features
 
-Python 3.8+
+- 🚀 **Complete API Coverage**: Full support for all Backpack Exchange API endpoints
+- 🔐 **Secure Authentication**: ED25519 signature-based authentication
+- 📡 **Real-time Data**: WebSocket support for live market data
+- ⚡ **Async Support**: Both synchronous and asynchronous operations
+- 🛡️ **Type Safety**: Full type hints and Pydantic models
+- 📊 **Market Data**: Order books, tickers, trades, and more
+- 💼 **Trading**: Order management, positions, and account operations
 
-## Installation & Usage
-### pip install
+## Installation
 
-If the python package is hosted on a repository, you can install directly using:
-
-```sh
-pip install git+https://github.com/elliottech/lighter-python.git
+```bash
+pip install -r requirements.txt
 ```
 
+## Quick Start
 
-Then import the package:
+### Public API (No Authentication Required)
+
 ```python
-import lighter
+from backpack import ApiClient, Configuration
+from backpack.api.markets_api import MarketsApi
+
+# Create configuration
+config = Configuration(host="https://api.backpack.exchange")
+api_client = ApiClient(config)
+
+# Get markets
+markets_api = MarketsApi(api_client)
+markets = markets_api.get_markets()
+print(f"Found {len(markets)} markets")
+
+# Get market info
+market_info = markets_api.get_market("SOL_USDC")
+print(f"SOL_USDC info: {market_info}")
+
+# Get order book
+depth = markets_api.get_depth("SOL_USDC", limit=10)
+print(f"Order book: {depth}")
 ```
 
-### Tests
-
-Execute `pytest` to run the tests.
-
-## Getting Started
-
-Please follow the [installation procedure](#installation--usage) and then run the following:
+### Authenticated API
 
 ```python
+from backpack import SignerClient
 
-import lighter
+# Create signer client with your API credentials
+signer_client = SignerClient(
+    api_key="your_api_key",
+    api_secret="your_api_secret"
+)
+
+# Get account information
+account = signer_client.get_account()
+print(f"Account: {account}")
+
+# Get balances
+balances = signer_client.get_balances()
+print(f"Balances: {balances}")
+
+# Create an order
+order = signer_client.create_order(
+    symbol="SOL_USDC",
+    side="Bid",
+    order_type="Limit",
+    quantity="1.0",
+    price="20.50"
+)
+print(f"Order created: {order}")
+```
+
+### WebSocket Real-time Data
+
+```python
+from backpack import WsClient
+
+def on_message(data):
+    print(f"Received: {data}")
+
+def on_error(error):
+    print(f"Error: {error}")
+
+# Create WebSocket client
+ws_client = WsClient(
+    on_message=on_message,
+    on_error=on_error
+)
+
+# Connect and subscribe
+if ws_client.connect():
+    # Subscribe to order book updates
+    ws_client.subscribe("depth.SOL_USDC")
+    
+    # Subscribe to ticker updates
+    ws_client.subscribe("ticker.SOL_USDC")
+    
+    # Run the client
+    ws_client.run()
+```
+
+### Async Operations
+
+```python
 import asyncio
+from backpack import ApiClient, Configuration
+from backpack.api.markets_api import MarketsApi
 
 async def main():
-    client = lighter.ApiClient()
-    account_api = lighter.AccountApi(client)
-    account = await account_api.get_account(by="index", value="1")
-    print(account)
+    config = Configuration(host="https://api.backpack.exchange")
+    api_client = ApiClient(config)
+    markets_api = MarketsApi(api_client)
+    
+    # Get markets asynchronously
+    markets = await markets_api.get_markets(async_req=True)
+    print(f"Found {len(markets)} markets")
+    
+    await api_client.close()
 
-if __name__ == "__main__":
-    asyncio.run(main())
-
+# Run async function
+asyncio.run(main())
 ```
 
-# Examples
-## [Read API Functions](examples/get_info.py)
-```sh
-python examples/get_info.py
+## API Modules
+
+### Public APIs
+- **MarketsApi**: Market data, order books, trades
+- **AssetsApi**: Asset information
+- **SystemApi**: System status
+- **TradesApi**: Public trade data
+
+### Authenticated APIs
+- **AccountApi**: Account information and balances
+- **OrderApi**: Order management
+- **PositionApi**: Position management
+- **CapitalApi**: Capital operations
+- **HistoryApi**: Historical data
+- **FundingApi**: Funding rates
+- **BorrowLendApi**: Borrowing and lending
+
+## WebSocket Streams
+
+### Public Streams
+- `ticker.<symbol>`: 24hr ticker statistics
+- `depth.<symbol>`: Order book depth updates
+- `bookTicker.<symbol>`: Best bid/ask prices
+- `trade.<symbol>`: Public trade data
+- `kline.<interval>.<symbol>`: K-line/candlestick data
+
+### Private Streams (Requires Authentication)
+- `account.orderUpdate`: Order updates
+- `account.positionUpdate`: Position updates
+- `account.rfqUpdate`: RFQ updates
+
+## Examples
+
+### Price Monitor
+```python
+python examples/backpack_price_monitor.py
 ```
 
-## [Websocket Sync Order Books & Accounts](examples/ws.py)
-```sh
-python examples/ws.py
+### Basic API Usage
+```python
+python examples/backpack_example.py
 ```
 
-## [Create & Cancel Orders](examples/create_cancel_order.py)
-```sh
-python examples/create_cancel_order.py
+### Async Price Monitor
+```python
+python examples/backpack_price_monitor.py async
 ```
 
-## Documentation for API Endpoints
+## Configuration
 
-All URIs are relative to *https://mainnet.zklighter.elliot.ai*
+### Environment Variables
+```bash
+export BACKPACK_API_KEY="your_api_key"
+export BACKPACK_API_SECRET="your_api_secret"
+export BACKPACK_HOST="https://api.backpack.exchange"
+```
 
-Class | Method | HTTP request | Description
------------- | ------------- | ------------- | -------------
-*AccountApi* | [**account**](docs/AccountApi.md#account) | **GET** /api/v1/account | account
-*AccountApi* | [**accounts_by_l1_address**](docs/AccountApi.md#accounts_by_l1_address) | **GET** /api/v1/accountsByL1Address | accountsByL1Address
-*AccountApi* | [**apikeys**](docs/AccountApi.md#apikeys) | **GET** /api/v1/apikeys | apikeys
-*AccountApi* | [**pnl**](docs/AccountApi.md#pnl) | **GET** /api/v1/pnl | pnl
-*AccountApi* | [**public_pools**](docs/AccountApi.md#public_pools) | **GET** /api/v1/publicPools | publicPools
-*BlockApi* | [**block**](docs/BlockApi.md#block) | **GET** /api/v1/block | block
-*BlockApi* | [**blocks**](docs/BlockApi.md#blocks) | **GET** /api/v1/blocks | blocks
-*BlockApi* | [**current_height**](docs/BlockApi.md#current_height) | **GET** /api/v1/currentHeight | currentHeight
-*CandlestickApi* | [**candlesticks**](docs/CandlestickApi.md#candlesticks) | **GET** /api/v1/candlesticks | candlesticks
-*CandlestickApi* | [**fundings**](docs/CandlestickApi.md#fundings) | **GET** /api/v1/fundings | fundings
-*OrderApi* | [**account_inactive_orders**](docs/OrderApi.md#account_inactive_orders) | **GET** /api/v1/accountInactiveOrders | accountInactiveOrders
-*OrderApi* | [**exchange_stats**](docs/OrderApi.md#exchange_stats) | **GET** /api/v1/exchangeStats | exchangeStats
-*OrderApi* | [**order_book_details**](docs/OrderApi.md#order_book_details) | **GET** /api/v1/orderBookDetails | orderBookDetails
-*OrderApi* | [**order_book_orders**](docs/OrderApi.md#order_book_orders) | **GET** /api/v1/orderBookOrders | orderBookOrders
-*OrderApi* | [**order_books**](docs/OrderApi.md#order_books) | **GET** /api/v1/orderBooks | orderBooks
-*OrderApi* | [**recent_trades**](docs/OrderApi.md#recent_trades) | **GET** /api/v1/recentTrades | recentTrades
-*OrderApi* | [**trades**](docs/OrderApi.md#trades) | **GET** /api/v1/trades | trades
-*RootApi* | [**info**](docs/RootApi.md#info) | **GET** /info | info
-*RootApi* | [**status**](docs/RootApi.md#status) | **GET** / | status
-*TransactionApi* | [**account_txs**](docs/TransactionApi.md#account_txs) | **GET** /api/v1/accountTxs | accountTxs
-*TransactionApi* | [**block_txs**](docs/TransactionApi.md#block_txs) | **GET** /api/v1/blockTxs | blockTxs
-*TransactionApi* | [**deposit_history**](docs/TransactionApi.md#deposit_history) | **GET** /api/v1/deposit/history | deposit_history
-*TransactionApi* | [**next_nonce**](docs/TransactionApi.md#next_nonce) | **GET** /api/v1/nextNonce | nextNonce
-*TransactionApi* | [**send_tx**](docs/TransactionApi.md#send_tx) | **POST** /api/v1/sendTx | sendTx
-*TransactionApi* | [**send_tx_batch**](docs/TransactionApi.md#send_tx_batch) | **POST** /api/v1/sendTxBatch | sendTxBatch
-*TransactionApi* | [**tx**](docs/TransactionApi.md#tx) | **GET** /api/v1/tx | tx
-*TransactionApi* | [**tx_from_l1_tx_hash**](docs/TransactionApi.md#tx_from_l1_tx_hash) | **GET** /api/v1/txFromL1TxHash | txFromL1TxHash
-*TransactionApi* | [**txs**](docs/TransactionApi.md#txs) | **GET** /api/v1/txs | txs
-*TransactionApi* | [**withdraw_history**](docs/TransactionApi.md#withdraw_history) | **GET** /api/v1/withdraw/history | withdraw_history
+### Configuration Object
+```python
+from backpack import Configuration
 
+config = Configuration(
+    host="https://api.backpack.exchange",
+    api_key="your_api_key",
+    api_secret="your_api_secret",
+    timeout=30,
+    retry_count=3
+)
+```
 
-## Documentation For Models
+## Authentication
 
- - [Account](docs/Account.md)
- - [AccountApiKeys](docs/AccountApiKeys.md)
- - [AccountMarketStats](docs/AccountMarketStats.md)
- - [AccountMetadata](docs/AccountMetadata.md)
- - [AccountPnL](docs/AccountPnL.md)
- - [AccountPosition](docs/AccountPosition.md)
- - [AccountStats](docs/AccountStats.md)
- - [ApiKey](docs/ApiKey.md)
- - [Block](docs/Block.md)
- - [Blocks](docs/Blocks.md)
- - [BridgeSupportedNetwork](docs/BridgeSupportedNetwork.md)
- - [Candlestick](docs/Candlestick.md)
- - [Candlesticks](docs/Candlesticks.md)
- - [ContractAddress](docs/ContractAddress.md)
- - [CurrentHeight](docs/CurrentHeight.md)
- - [Cursor](docs/Cursor.md)
- - [DepositHistory](docs/DepositHistory.md)
- - [DepositHistoryItem](docs/DepositHistoryItem.md)
- - [DetailedAccount](docs/DetailedAccount.md)
- - [DetailedAccounts](docs/DetailedAccounts.md)
- - [DetailedCandlestick](docs/DetailedCandlestick.md)
- - [EnrichedTx](docs/EnrichedTx.md)
- - [ExchangeStats](docs/ExchangeStats.md)
- - [Funding](docs/Funding.md)
- - [Fundings](docs/Fundings.md)
- - [L1ProviderInfo](docs/L1ProviderInfo.md)
- - [Liquidation](docs/Liquidation.md)
- - [MarketInfo](docs/MarketInfo.md)
- - [NextNonce](docs/NextNonce.md)
- - [Order](docs/Order.md)
- - [OrderBook](docs/OrderBook.md)
- - [OrderBookDepth](docs/OrderBookDepth.md)
- - [OrderBookDetail](docs/OrderBookDetail.md)
- - [OrderBookDetails](docs/OrderBookDetails.md)
- - [OrderBookOrders](docs/OrderBookOrders.md)
- - [OrderBookStats](docs/OrderBookStats.md)
- - [OrderBooks](docs/OrderBooks.md)
- - [Orders](docs/Orders.md)
- - [PnLEntry](docs/PnLEntry.md)
- - [PositionFunding](docs/PositionFunding.md)
- - [PriceLevel](docs/PriceLevel.md)
- - [PublicPool](docs/PublicPool.md)
- - [PublicPoolInfo](docs/PublicPoolInfo.md)
- - [PublicPoolShare](docs/PublicPoolShare.md)
- - [PublicPools](docs/PublicPools.md)
- - [ReqGetAccount](docs/ReqGetAccount.md)
- - [ReqGetAccountApiKeys](docs/ReqGetAccountApiKeys.md)
- - [ReqGetAccountByL1Address](docs/ReqGetAccountByL1Address.md)
- - [ReqGetAccountInactiveOrders](docs/ReqGetAccountInactiveOrders.md)
- - [ReqGetAccountPnL](docs/ReqGetAccountPnL.md)
- - [ReqGetAccountTxs](docs/ReqGetAccountTxs.md)
- - [ReqGetBlock](docs/ReqGetBlock.md)
- - [ReqGetBlockTxs](docs/ReqGetBlockTxs.md)
- - [ReqGetByAccount](docs/ReqGetByAccount.md)
- - [ReqGetCandlesticks](docs/ReqGetCandlesticks.md)
- - [ReqGetDepositHistory](docs/ReqGetDepositHistory.md)
- - [ReqGetFundings](docs/ReqGetFundings.md)
- - [ReqGetL1Tx](docs/ReqGetL1Tx.md)
- - [ReqGetLatestDeposit](docs/ReqGetLatestDeposit.md)
- - [ReqGetNextNonce](docs/ReqGetNextNonce.md)
- - [ReqGetOrderBookDetails](docs/ReqGetOrderBookDetails.md)
- - [ReqGetOrderBookOrders](docs/ReqGetOrderBookOrders.md)
- - [ReqGetOrderBooks](docs/ReqGetOrderBooks.md)
- - [ReqGetPublicPools](docs/ReqGetPublicPools.md)
- - [ReqGetRangeWithCursor](docs/ReqGetRangeWithCursor.md)
- - [ReqGetRangeWithIndex](docs/ReqGetRangeWithIndex.md)
- - [ReqGetRangeWithIndexSortable](docs/ReqGetRangeWithIndexSortable.md)
- - [ReqGetRecentTrades](docs/ReqGetRecentTrades.md)
- - [ReqGetTrades](docs/ReqGetTrades.md)
- - [ReqGetTx](docs/ReqGetTx.md)
- - [ReqGetWithdrawHistory](docs/ReqGetWithdrawHistory.md)
- - [ResultCode](docs/ResultCode.md)
- - [SimpleOrder](docs/SimpleOrder.md)
- - [Status](docs/Status.md)
- - [SubAccounts](docs/SubAccounts.md)
- - [Ticker](docs/Ticker.md)
- - [Trade](docs/Trade.md)
- - [Trades](docs/Trades.md)
- - [Tx](docs/Tx.md)
- - [TxHash](docs/TxHash.md)
- - [TxHashes](docs/TxHashes.md)
- - [Txs](docs/Txs.md)
- - [ValidatorInfo](docs/ValidatorInfo.md)
- - [WithdrawHistory](docs/WithdrawHistory.md)
- - [WithdrawHistoryItem](docs/WithdrawHistoryItem.md)
- - [ZkLighterInfo](docs/ZkLighterInfo.md)
+The Backpack Exchange API uses ED25519 signature-based authentication:
 
+1. **API Key**: Your public key (base64 encoded)
+2. **API Secret**: Your private key for signing requests
+3. **Signing**: All authenticated requests must be signed with ED25519
 
-[//]: # (<a id="documentation-for-authorization"></a>)
+### Request Signing Process
 
-[//]: # (## Documentation For Authorization)
+1. Build the signing string with instruction, parameters, timestamp, and window
+2. Sign the string with your private key using ED25519
+3. Include the signature in the `X-Signature` header
 
-[//]: # ()
-[//]: # (Endpoints do not require authorization.)
+## Error Handling
 
+```python
+from backpack.exceptions import ApiException, AuthenticationError
 
+try:
+    account = signer_client.get_account()
+except AuthenticationError as e:
+    print(f"Authentication failed: {e}")
+except ApiException as e:
+    print(f"API error: {e}")
+```
+
+## Rate Limits
+
+The API has rate limits that vary by endpoint:
+- Public endpoints: 120 requests per minute
+- Authenticated endpoints: 60 requests per minute
+- WebSocket connections: 1 connection per API key
+
+## WebSocket Connection Management
+
+```python
+# Automatic reconnection
+ws_client = WsClient(
+    on_message=handle_message,
+    on_error=handle_error,
+    on_close=handle_close
+)
+
+# Manual connection management
+if ws_client.connect():
+    ws_client.subscribe("ticker.SOL_USDC")
+    ws_client.run()
+```
+
+## Development
+
+### Running Tests
+```bash
+pytest tests/
+```
+
+### Code Formatting
+```bash
+black backpack/
+flake8 backpack/
+```
+
+### Type Checking
+```bash
+mypy backpack/
+```
+
+## License
+
+This project is licensed under the MIT License.
+
+## Support
+
+For issues and questions:
+- GitHub Issues: [Create an issue](https://github.com/your-repo/backpack-python-sdk/issues)
+- Documentation: [Backpack Exchange API Docs](https://docs.backpack.exchange)
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Add tests
+5. Submit a pull request
+
+## Changelog
+
+### v1.0.0
+- Initial release
+- Full API coverage
+- WebSocket support
+- Async operations
+- Type safety with Pydantic
