@@ -242,27 +242,35 @@ class AccountTrader:
         update_account_status(self.account_name, 'wait_status', '初始化中')
         update_account_status(self.account_name, 'loop_count', 0)
         
+        # 为每个资金费率时间点随机生成前后偏移量（5-50分钟），在程序运行期间固定
+        # funding_windows 格式: {时间点(分钟): (前偏移(分钟), 后偏移(分钟))}
+        self.funding_windows = {}
+        funding_times = [0, 8 * 60, 16 * 60]  # 00:00, 08:00, 16:00
+        for ft in funding_times:
+            before_offset = random.randint(5, 50)  # 前偏移 5-50 分钟
+            after_offset = random.randint(5, 50)   # 后偏移 5-50 分钟
+            self.funding_windows[ft] = (before_offset, after_offset)
+            self.logger.info(f"资金费率时间点 {ft//60:02d}:{ft%60:02d} 窗口设置为: 前{before_offset}分钟, 后{after_offset}分钟")
+        
     def _seconds_remaining_in_funding_window(self) -> int:
-        """判断是否处于资金费率窗口（北京时间 00:00/08:00/16:00 前后5分钟）。
+        """判断是否处于资金费率窗口（北京时间 00:00/08:00/16:00 前后随机5-50分钟）。
         返回：处于窗口则返回距离窗口结束的秒数；否则返回0。
         """
         try:
             now_utc = datetime.now(timezone.utc)
             now_cst = now_utc.astimezone(timezone(timedelta(hours=8)))
             minutes = now_cst.hour * 60 + now_cst.minute
-
-            funding_minutes = [0, 8 * 60, 16 * 60]  # 00:00, 08:00, 16:00
             day_minutes = 24 * 60
 
-            for m in funding_minutes:
-                start = (m - 5) % day_minutes
-                end = (m + 5) % day_minutes
+            for funding_time, (before_offset, after_offset) in self.funding_windows.items():
+                start = (funding_time - before_offset) % day_minutes
+                end = (funding_time + after_offset) % day_minutes
 
                 if start <= end:
                     in_window = (start <= minutes <= end)
                     remaining_min = end - minutes
                 else:
-                    # 跨天窗口，例如 23:55~00:05
+                    # 跨天窗口
                     in_window = (minutes >= start) or (minutes <= end)
                     # 计算到end的正向距离（取模）
                     remaining_min = (end - minutes) % day_minutes
