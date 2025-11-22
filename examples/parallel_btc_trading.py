@@ -2009,19 +2009,46 @@ class AccountTrader:
 
 
 def read_accounts_from_csv(csv_file="examples/accounts.csv"):
-    """从CSV文件读取账户配置"""
+    """从CSV文件读取账户配置，自动检测编码"""
     accounts = []
     
     if not os.path.exists(csv_file):
         logging.error(f"找不到CSV文件: {csv_file}")
         return accounts
     
-    with open(csv_file, 'r', encoding='utf-8') as file:
-        reader = csv.DictReader(file)
-        for row in reader:
-            accounts.append(row)
+    # 尝试多种编码方式读取CSV文件
+    encodings = ['utf-8', 'utf-8-sig', 'gbk', 'gb2312', 'gb18030', 'latin1', 'cp1252', 'iso-8859-1']
     
-    return accounts
+    for encoding in encodings:
+        try:
+            with open(csv_file, 'r', encoding=encoding) as file:
+                reader = csv.DictReader(file)
+                for row in reader:
+                    accounts.append(row)
+            
+            logging.info(f"成功使用 {encoding} 编码读取CSV文件: {csv_file}, 读取到 {len(accounts)} 个账户")
+            return accounts
+            
+        except UnicodeDecodeError:
+            # 编码不匹配，尝试下一个
+            continue
+        except Exception as e:
+            # 其他错误（如CSV格式错误），记录并继续尝试
+            logging.warning(f"使用 {encoding} 编码读取CSV时出错: {e}")
+            continue
+    
+    # 如果所有编码都失败，尝试使用错误处理方式
+    logging.warning("所有编码尝试失败，使用错误处理方式读取...")
+    try:
+        with open(csv_file, 'r', encoding='utf-8', errors='replace') as file:
+            reader = csv.DictReader(file)
+            for row in reader:
+                accounts.append(row)
+        logging.warning(f"使用错误处理方式读取到 {len(accounts)} 个账户（部分字符可能显示异常）")
+        return accounts
+    except Exception as e:
+        logging.error(f"读取CSV文件失败: {e}")
+        return accounts
 
 
 async def run_trader_in_async(account_info):
