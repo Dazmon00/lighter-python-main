@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
 """
-多线程BTC交易脚本
+多线程交易脚本（支持多个交易对）
 
 从CSV读取配置，每组账号对应一条线程，执行以下逻辑：
-1. paradex获取当前BTC价格，挂限价空单（当前ask价格），监控成交
+1. paradex获取当前价格，挂限价空单（当前ask价格），监控成交
 2. 如果10秒不成交，重新获取价格并重新挂单
-3. 成交后，市价开多单lighter BTC
+3. 成交后，市价开多单lighter
 4. 等待配置时间
-5. paradex获取当前BTC价格，挂限价多单（当前bid价格），监控成交
+5. paradex获取当前价格，挂限价多单（当前bid价格），监控成交
 6. 如果10秒不成交，重新获取价格并重新挂单
-7. 成交后，市价开空单lighter BTC
+7. 成交后，市价开空单lighter
+
+CSV文件需要包含以下列：
+- account_index: Lighter账户索引
+- api_key_index: API密钥索引
+- api_key_private_key: API密钥私钥
+- paradex_eth_key: Paradex以太坊私钥
+- description: 账户描述
+- wait_time: 等待时间（秒）
+- market: 交易对名称（如 BTC-USD-PERP）
+- order_size: 订单大小（如 0.001）
+- market_index: Lighter市场索引（如 1）
 """
 
 import asyncio
@@ -47,10 +58,10 @@ from paradex.utils import (
     get_l1_eth_account,
 )
 
-# 配置日志 - 文件输出详细日志，控制台输出警告和错误
+# 配置日志 - 文件输出详细日志，控制台完全不输出日志（只显示表格）
 log_filename = f"trading_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
-# 创建文件处理器（INFO级别）
+# 创建文件处理器（DEBUG级别）
 file_handler = logging.FileHandler(log_filename, encoding='utf-8')
 file_handler.setLevel(logging.DEBUG)  # 文件记录所有日志
 file_handler.setFormatter(logging.Formatter(
@@ -58,18 +69,13 @@ file_handler.setFormatter(logging.Formatter(
     datefmt="%Y-%m-%d %H:%M:%S"
 ))
 
-# 创建控制台处理器（WARNING级别，减少干扰）
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.WARNING)  # 控制台只显示警告和错误
-console_handler.setFormatter(logging.Formatter(
-    "%(asctime)s.%(msecs)03d | [%(threadName)s] %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-))
+# 不创建控制台处理器，完全隐藏所有日志（只显示表格）
+# 所有日志只写入文件
 
-# 配置根日志记录器
+# 配置根日志记录器（只使用文件处理器）
 logging.basicConfig(
-    level=logging.DEBUG,  # 根级别设为DEBUG，让handlers自己过滤
-    handlers=[file_handler, console_handler]
+    level=logging.DEBUG,  # 根级别设为DEBUG
+    handlers=[file_handler]  # 只使用文件处理器，不输出到控制台
 )
 
 logger = logging.getLogger(__name__)
@@ -78,13 +84,12 @@ logger.info(f"日志文件已创建: {log_filename}")
 # 配置参数
 PARADEX_HTTP_URL = "https://api.prod.paradex.trade/v1"
 LIGHTER_URL = "https://mainnet.zklighter.elliot.ai"
-BTC_MARKET = "BTC-USD-PERP"
-ORDER_SIZE = Decimal("0.001")  # 0.0005 BTC
-CLIENT_ID_SHORT = "btc-short-order"
-CLIENT_ID_LONG = "btc-long-order"
+# 默认值（如果CSV中没有指定，使用这些默认值）
+DEFAULT_MARKET = "BTC-USD-PERP"
+DEFAULT_ORDER_SIZE = Decimal("0.001")
+DEFAULT_MARKET_INDEX = 1
 MAX_WAIT_TIME = 10  # 10秒超时
 MAX_RETRIES = 5  # 最大重试次数
-LIGHTER_BTC_MARKET_INDEX = 1  # BTC市场索引
 
 # 全局状态字典，用于UI显示
 account_status = defaultdict(dict)
@@ -92,6 +97,24 @@ account_status_lock = threading.Lock()
 
 # 全局退出事件：Ctrl+C 时置位，让各线程优雅退出并执行清理
 shutdown_event = threading.Event()
+
+# 全局代理配置字典（按账户名存储）
+account_proxy_config = {}
+account_proxy_lock = threading.Lock()
+
+# 创建带代理的aiohttp ClientSession的辅助函数
+async def create_proxy_session(account_name=None):
+    """创建带代理的aiohttp ClientSession"""
+    import aiohttp
+    proxy_url = None
+    if account_name:
+        with account_proxy_lock:
+            proxy_url = account_proxy_config.get(account_name)
+    
+    if proxy_url:
+        return aiohttp.ClientSession(connector=aiohttp.TCPConnector())
+    else:
+        return aiohttp.ClientSession()
 
 
 def update_account_status(account_name, key, value):
@@ -101,34 +124,34 @@ def update_account_status(account_name, key, value):
 
 
 def format_status_table():
-    """格式化状态表格 - 使用rich库"""
-    try:
-        os.system('clear' if os.name != 'nt' else 'cls')
-    except:
-        pass
+    """格式化状态表格 - 使用rich库，返回表格对象或None"""
+    import os
+    from datetime import datetime
     
     with account_status_lock:
         if not account_status:
-            print("暂无账户数据...")
-            return
+            return None
         
         # 使用rich创建表格
         try:
             from rich.console import Console
             from rich.table import Table
-            from rich.live import Live
+            from rich.text import Text
             
             console = Console()
-            table = Table(title=f"BTC交易监控面板 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", 
-                         show_header=True, header_style="bold cyan")
+            table = Table(title=f"交易监控面板 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", 
+                         show_header=True, header_style="bold cyan", 
+                         title_style="bold yellow", box=None)
             
-            table.add_column("账号", justify="center", width=20)
-            table.add_column("初始余额(paradex/lighter)", justify="center", width=35)
-            table.add_column("当前余额(paradex/lighter)", justify="center", width=35)
-            table.add_column("当前持仓(paradex/lighter)", justify="center", width=30)
-            table.add_column("磨损", justify="center", width=20)
-            table.add_column("循环次数", justify="center", width=12)
-            table.add_column("等待倒计时", justify="center", width=15)
+            # 使用固定列宽，不自适应屏幕大小
+            table.add_column("账号", justify="left", width=18, no_wrap=True)
+            table.add_column("交易对", justify="center", width=12, no_wrap=True)
+            table.add_column("初始余额(P/L)", justify="right", width=28, no_wrap=True)
+            table.add_column("当前余额(P/L)", justify="right", width=28, no_wrap=True)
+            table.add_column("持仓(P/L)", justify="center", width=24, no_wrap=True)
+            table.add_column("磨损", justify="right", width=12, no_wrap=True)
+            table.add_column("循环", justify="center", width=8, no_wrap=True)
+            table.add_column("状态", justify="center", width=20, no_wrap=True)
             
             for account_name, status in sorted(account_status.items()):
                 init_bal_p = status.get('initial_balance_paradex', 0)
@@ -140,6 +163,7 @@ def format_status_table():
                 loop_count = status.get('loop_count', 0)
                 wait_status = status.get('wait_status', '准备中')
                 countdown = status.get('countdown', '')
+                market = status.get('market', 'N/A')
                 
                 init_total = f"{init_bal_p:.2f}+{init_bal_l:.2f}={init_bal_p+init_bal_l:.2f}"
                 curr_total = f"{curr_bal_p:.2f}+{curr_bal_l:.2f}={curr_bal_p+curr_bal_l:.2f}"
@@ -153,31 +177,53 @@ def format_status_table():
                 init_sum = init_bal_p + init_bal_l
                 curr_sum = curr_bal_p + curr_bal_l
                 loss = init_sum - curr_sum
-                loss_str = f"-{loss:.2f}" if loss > 0 else f"+{abs(loss):.2f}"
+                if loss > 0:
+                    loss_str = f"-{loss:.4f}"
+                    loss_style = "red"
+                elif loss < 0:
+                    loss_str = f"+{abs(loss):.4f}"
+                    loss_style = "green"
+                else:
+                    loss_str = "0.0000"
+                    loss_style = None
                 
-                table.add_row(
+                # 格式化余额显示，保留4位小数
+                init_total = f"{init_bal_p:.4f}/{init_bal_l:.4f}"
+                curr_total = f"{curr_bal_p:.4f}/{curr_bal_l:.4f}"
+                
+                # 添加行，带样式
+                from rich.text import Text
+                row_items = [
                     account_name,
+                    market,
                     init_total,
                     curr_total,
                     position_total,
-                    loss_str,
+                    Text(loss_str, style=loss_style) if loss_style else loss_str,
                     str(loop_count),
                     status_display
-                )
+                ]
+                table.add_row(*row_items)
             
-            console.print(table)
+            return table
             
         except ImportError:
             # 如果rich未安装，使用简单表格
-            print("=" * 100)
-            print(f"BTC交易监控面板 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            print("=" * 100)
+            print("=" * 120)
+            print(f"交易监控面板 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print("=" * 120)
             
-            # 表格头部
-            print("┌" + "─" * 20 + "┬" + "─" * 35 + "┬" + "─" * 35 + "┬" + "─" * 30 + "┬" + "─" * 20 + "┬" + "─" * 12 + "┬" + "─" * 15 + "┐")
-            print("│" + "账号".center(20) + "│" + "初始余额(paradex/lighter)".center(35) + "│" + 
-                  "当前余额(paradex/lighter)".center(35) + "│" + "当前持仓(paradex/lighter)".center(30) + "│" + "磨损".center(20) + "│" + "循环次数".center(12) + "│" + "等待倒计时".center(15) + "│")
-            print("├" + "─" * 20 + "┼" + "─" * 35 + "┼" + "─" * 35 + "┼" + "─" * 30 + "┼" + "─" * 20 + "┼" + "─" * 12 + "┼" + "─" * 15 + "┤")
+            # 表格头部 - 使用固定列宽
+            col_widths = [18, 12, 28, 28, 24, 12, 8, 20]
+            col_names = ["账号", "交易对", "初始余额(P/L)", "当前余额(P/L)", "持仓(P/L)", "磨损", "循环", "状态"]
+            header_line = "┌" + "┐".join("─" * w for w in col_widths) + "┐"
+            sep_line = "├" + "┤".join("─" * w for w in col_widths) + "┤"
+            footer_line = "└" + "┘".join("─" * w for w in col_widths) + "┘"
+            
+            print(header_line)
+            header_row = "│".join(name.center(w) for name, w in zip(col_names, col_widths))
+            print(f"│{header_row}│")
+            print(sep_line)
             
             # 表格内容
             for account_name, status in sorted(account_status.items()):
@@ -190,9 +236,11 @@ def format_status_table():
                 loop_count = status.get('loop_count', 0)
                 wait_status = status.get('wait_status', '准备中')
                 countdown = status.get('countdown', '')
+                market = status.get('market', 'N/A')
                 
-                init_total = f"{init_bal_p:.2f}+{init_bal_l:.2f}={init_bal_p+init_bal_l:.2f}"
-                curr_total = f"{curr_bal_p:.2f}+{curr_bal_l:.2f}={curr_bal_p+curr_bal_l:.2f}"
+                # 格式化余额显示，保留4位小数
+                init_total = f"{init_bal_p:.4f}/{init_bal_l:.4f}"
+                curr_total = f"{curr_bal_p:.4f}/{curr_bal_l:.4f}"
                 position_total = f"{paradex_pos}/{lighter_pos}"
                 
                 status_display = wait_status
@@ -203,24 +251,80 @@ def format_status_table():
                 init_sum = init_bal_p + init_bal_l
                 curr_sum = curr_bal_p + curr_bal_l
                 loss = init_sum - curr_sum
-                loss_str = f"-{loss:.2f}" if loss > 0 else f"+{abs(loss):.2f}"
+                loss_str = f"-{loss:.4f}" if loss > 0 else f"+{abs(loss):.4f}" if loss < 0 else "0.0000"
                 
-                print(f"│ {account_name.ljust(19)}│ {init_total.center(34)}│ {curr_total.center(34)}│ " +
-                      f"{position_total.center(29)}│ {loss_str.center(19)}│ {str(loop_count).center(11)}│ {status_display.center(14)}│")
+                # 格式化每列数据
+                col_widths = [18, 12, 28, 28, 24, 12, 8, 20]
+                row_data = [
+                    account_name[:17].ljust(17),
+                    market.center(11),
+                    init_total.rjust(27),
+                    curr_total.rjust(27),
+                    position_total.center(23),
+                    loss_str.rjust(11),
+                    str(loop_count).center(7),
+                    status_display[:19].center(19)
+                ]
+                
+                row_line = "│".join(data.center(w) if i in [1, 4, 6, 7] else data.ljust(w) if i == 0 else data.rjust(w) 
+                                   for i, (data, w) in enumerate(zip(row_data, col_widths)))
+                print(f"│{row_line}│")
             
-            print("└" + "─" * 20 + "┴" + "─" * 35 + "┴" + "─" * 35 + "┴" + "─" * 30 + "┴" + "─" * 20 + "┴" + "─" * 12 + "┴" + "─" * 15 + "┘")
+            # 打印表格底部
+            col_widths = [18, 12, 28, 28, 24, 12, 8, 20]
+            footer_line = "└" + "┘".join("─" * w for w in col_widths) + "┘"
+            print(footer_line)
 
 
 def run_status_monitor():
     """运行状态监控 - 每2秒更新一次表格"""
-    while True:
+    from rich.live import Live
+    from rich.console import Console
+    
+    console = Console()
+    
+    # 使用Live实现实时更新，避免屏幕滚动
+    try:
+        # 清屏一次，然后使用Live更新（screen=True会保留屏幕，只更新Live区域）
         try:
-            format_status_table()
-            time.sleep(2)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            print(f"状态监控错误: {e}")
+            os.system('clear' if os.name != 'nt' else 'cls')
+        except:
+            pass
+        
+        with Live(console=console, refresh_per_second=0.5, screen=True, vertical_overflow="visible", redirect_stderr=False) as live:
+            while True:
+                try:
+                    # 获取表格并更新（不清屏，让Live自动处理）
+                    table = format_status_table()
+                    if table:
+                        live.update(table)
+                    else:
+                        live.update("暂无账户数据...")
+                    
+                    time.sleep(2)
+                except KeyboardInterrupt:
+                    break
+                except Exception as e:
+                    # 使用print而不是logging，避免显示在控制台
+                    # logging.error会输出到控制台，而我们已经设置了WARNING级别
+                    pass
+                    time.sleep(2)
+    except Exception:
+        # 如果Live失败，回退到简单模式（清屏后打印）
+        import os
+        while True:
+            try:
+                try:
+                    os.system('clear' if os.name != 'nt' else 'cls')
+                except:
+                    pass
+                format_status_table()
+                time.sleep(2)
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                # 静默处理错误，不输出日志
+                time.sleep(2)
             time.sleep(5)
 
 
@@ -238,14 +342,44 @@ class AccountTrader:
         self.account_name = account_info.get('description', 'Unknown')
         self.shutting_down = False  # 退出清理标记
         
+        # 从account_info读取市场参数，如果没有则使用默认值
+        self.market = account_info.get('market', DEFAULT_MARKET).strip()
+        try:
+            self.order_size = Decimal(str(account_info.get('order_size', DEFAULT_ORDER_SIZE)))
+        except (ValueError, TypeError):
+            self.order_size = DEFAULT_ORDER_SIZE
+            self.logger.warning(f"无效的order_size值，使用默认值: {DEFAULT_ORDER_SIZE}")
+        
+        # 从account_info读取代理配置
+        proxy_url = account_info.get('proxy_url', '').strip()
+        self.proxy_url = proxy_url if proxy_url else None
+        if self.proxy_url:
+            self.logger.info(f"代理配置: {self.proxy_url}")
+        else:
+            self.logger.info("未配置代理，使用直连")
+        
+        # 初始化market_index相关属性（将在initialize_lighter中设置）
+        self.market_index = None
+        self.size_decimals = None
+        self._csv_market_index = None  # 保留此属性以兼容错误处理逻辑
+        
+        # 生成客户端ID（基于市场名称）
+        market_symbol = self.market.split('-')[0].lower()  # 从BTC-USD-PERP提取BTC
+        self.client_id_short = f"{market_symbol}-short-order"
+        self.client_id_long = f"{market_symbol}-long-order"
+        
+        self.logger.info(f"交易对配置: market={self.market}, order_size={self.order_size}")
+        
         # 初始化状态
         update_account_status(self.account_name, 'wait_status', '初始化中')
         update_account_status(self.account_name, 'loop_count', 0)
+        update_account_status(self.account_name, 'market', self.market)
         
         # 为每个资金费率时间点随机生成前后偏移量（5-50分钟），在程序运行期间固定
         # funding_windows 格式: {时间点(分钟): (前偏移(分钟), 后偏移(分钟))}
         self.funding_windows = {}
         funding_times = [0, 8 * 60, 16 * 60]  # 00:00, 08:00, 16:00
+        # funding_times = [0, 8 * 60]  # 00:00, 08:00, 16:00
         for ft in funding_times:
             before_offset = random.randint(5, 50)  # 前偏移 5-50 分钟
             after_offset = random.randint(5, 50)   # 后偏移 5-50 分钟
@@ -315,6 +449,12 @@ class AccountTrader:
         
         paradex_eth_key = self.account_info['paradex_eth_key']
         
+        # 如果配置了代理，设置全局代理配置（用于Paradex API调用）
+        if self.proxy_url:
+            self.logger.info(f"为Paradex配置代理: {self.proxy_url}")
+            with account_proxy_lock:
+                account_proxy_config[self.account_name] = self.proxy_url
+        
         # 创建配置
         self.config = ApiConfig()
         self.config.paradex_http_url = PARADEX_HTTP_URL
@@ -362,6 +502,133 @@ class AccountTrader:
             update_account_status(self.account_name, 'initial_balance_paradex', 0)
             update_account_status(self.account_name, 'current_balance_paradex', 0)
     
+    async def get_market_index_from_api(self):
+        """通过API查询market_index - 根据Paradex market名称自动查找对应的Lighter market_id"""
+        try:
+            self.logger.info(f"正在查询 {self.market} 对应的Lighter market_index...")
+            
+            # 从Paradex market名称提取基础资产（如BTC-USD-PERP -> BTC）
+            base_asset = self.market.split('-')[0].upper()
+            
+            # 创建临时API客户端用于查询
+            from lighter.configuration import Configuration
+            temp_config = Configuration(host=LIGHTER_URL)
+            if self.proxy_url:
+                temp_config.proxy = self.proxy_url
+            
+            temp_api_client = lighter.ApiClient(configuration=temp_config)
+            account_api = lighter.AccountApi(temp_api_client)
+            order_api = lighter.OrderApi(temp_api_client)
+            
+            try:
+                # 方法1: 通过账户持仓信息获取所有市场，精确匹配symbol（最准确）
+                try:
+                    account_info = await account_api.account(
+                        by="index",
+                        value=str(self.account_info['account_index'])
+                    )
+                    
+                    if hasattr(account_info, 'accounts') and account_info.accounts:
+                        account = account_info.accounts[0]
+                        if hasattr(account, 'positions') and account.positions:
+                            self.logger.info(f"从账户持仓信息中查找 {base_asset} 对应的 market_id...")
+                            
+                            # 遍历所有持仓，查找精确匹配的symbol（避免ETH匹配到ETHFI）
+                            for pos in account.positions:
+                                if hasattr(pos, 'symbol') and hasattr(pos, 'market_id'):
+                                    pos_symbol = pos.symbol.upper()
+                                    market_id = pos.market_id
+                                    
+                                    # 精确匹配：symbol必须完全相等（不能使用in，避免ETH匹配到ETHFI）
+                                    if pos_symbol == base_asset:
+                                        self.logger.info(f"✓ 找到精确匹配：symbol={pos.symbol}, market_id={market_id}")
+                                        # 验证market_id是否有效
+                                        try:
+                                            order_book = await order_api.order_book_orders(market_id=market_id, limit=1)
+                                            if order_book and (not hasattr(order_book, 'code') or order_book.code == 200):
+                                                self.logger.info(f"✓ 验证成功！{self.market} 对应 market_index={market_id}")
+                                                return market_id
+                                        except Exception as e:
+                                            self.logger.warning(f"market_id={market_id} 验证失败: {e}")
+                except Exception as e:
+                    self.logger.warning(f"通过账户持仓信息查询失败: {e}")
+                
+                # 方法2: 通过order_books API查询所有市场，精确匹配symbol
+                try:
+                    order_books_response = await order_api.order_books()
+                    # order_books返回的是OrderBooks对象，包含order_books列表
+                    if order_books_response and hasattr(order_books_response, 'order_books'):
+                        order_books_list = order_books_response.order_books
+                        if order_books_list:
+                            self.logger.info(f"从订单簿详情中查找 {base_asset} 对应的 market_id...")
+                            self.logger.info(f"Lighter上共有 {len(order_books_list)} 个市场")
+                            
+                            # 记录所有可用市场（用于调试）
+                            available_symbols = []
+                            for detail in order_books_list:
+                                if hasattr(detail, 'symbol') and hasattr(detail, 'market_id'):
+                                    detail_symbol = detail.symbol.upper()
+                                    market_id = detail.market_id
+                                    available_symbols.append(f"{detail.symbol}({market_id})")
+                                    
+                                    # 精确匹配：symbol必须完全相等
+                                    if detail_symbol == base_asset:
+                                        self.logger.info(f"✓ 从订单簿详情找到精确匹配：symbol={detail.symbol}, market_id={market_id}")
+                                        return market_id
+                            
+                            # 如果没有找到匹配，记录所有可用市场
+                            self.logger.warning(f"⚠️ 未找到 {base_asset} 匹配的市场")
+                            self.logger.info(f"Lighter上可用的市场symbol列表（前30个）: {', '.join(available_symbols[:30])}")
+                            if len(available_symbols) > 30:
+                                self.logger.info(f"... 还有 {len(available_symbols) - 30} 个市场")
+                                # 尝试查找类似的symbol（包含base_asset的）
+                                similar_symbols = [s for s in available_symbols if base_asset in s.upper()]
+                                if similar_symbols:
+                                    self.logger.info(f"⚠️ 找到包含 '{base_asset}' 的类似市场: {', '.join(similar_symbols)}")
+                        else:
+                            self.logger.warning(f"order_books返回的列表为空")
+                    else:
+                        self.logger.warning(f"order_books返回结果格式不正确")
+                except Exception as e:
+                    self.logger.warning(f"通过订单簿详情查询失败: {e}")
+                    import traceback
+                    self.logger.debug(traceback.format_exc())
+                    
+            finally:
+                await temp_api_client.close()
+            
+            # 如果所有API查询方法都失败
+            base_asset = self.market.split('-')[0].upper()
+            self.logger.error(f"❌ 无法通过API查询到 {self.market} 对应的 market_index")
+            self.logger.error(f"可能的原因：")
+            self.logger.error(f"  1. {base_asset} 交易对在Lighter上不存在")
+            self.logger.error(f"  2. Lighter上的symbol名称与Paradex不同（例如：Lighter可能是 {base_asset}USDT 而不是 {base_asset}）")
+            self.logger.error(f"  3. 该交易对尚未在Lighter上架")
+            self.logger.error(f"请检查：")
+            self.logger.error(f"  - Lighter是否支持 {self.market} 交易对")
+            self.logger.error(f"  - 访问 Lighter API 查看所有可用市场")
+            
+            if self._csv_market_index is not None:
+                self.logger.warning(f"⚠️ 使用CSV中指定的 market_index: {self._csv_market_index}")
+                return self._csv_market_index
+            else:
+                raise Exception(f"无法确定 {self.market} 的 market_index，该交易对可能在Lighter上不存在")
+                
+        except Exception as e:
+            self.logger.error(f"查询 market_index 失败: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            
+            base_asset = self.market.split('-')[0].upper()
+            # 如果查询失败且有CSV备用值，使用它
+            if self._csv_market_index is not None:
+                self.logger.warning(f"⚠️ API查询异常，使用CSV中指定的 market_index: {self._csv_market_index}")
+                return self._csv_market_index
+            else:
+                self.logger.error(f"❌ 无法确定 {self.market} 的 market_index")
+                self.logger.error(f"可能的原因：{base_asset} 交易对在Lighter上不存在或symbol名称不同")
+                raise Exception(f"无法确定 {self.market} 的 market_index: {e}")
+    
     async def initialize_lighter(self):
         """初始化Lighter客户端"""
         update_account_status(self.account_name, 'wait_status', '初始化Lighter...')
@@ -369,6 +636,113 @@ class AccountTrader:
         
         # 使用ApiNonceManager以每次都从API获取最新nonce
         import lighter.nonce_manager as nm
+        from lighter.configuration import Configuration
+        
+        # 创建配置对象
+        lighter_config = Configuration(host=LIGHTER_URL)
+        
+        # 如果配置了代理，设置代理（用于查询）
+        if self.proxy_url:
+            self.logger.info(f"为Lighter配置代理: {self.proxy_url}")
+            lighter_config.proxy = self.proxy_url
+        
+        # 创建临时API客户端用于查询
+        temp_api_client = lighter.ApiClient(configuration=lighter_config)
+        
+        # 先通过API查询market_index
+        self.market_index = await self.get_market_index_from_api()
+        self.logger.info(f"✓ 确定 market_index: {self.market_index} (对应 {self.market})")
+        
+        # 获取市场的size_decimals用于订单大小转换
+        try:
+            order_api = lighter.OrderApi(temp_api_client)
+            order_book_details_response = await order_api.order_book_details(market_id=self.market_index)
+            
+            # order_book_details返回的是OrderBookDetails对象，包含order_book_details列表
+            if order_book_details_response and hasattr(order_book_details_response, 'order_book_details'):
+                order_book_details_list = order_book_details_response.order_book_details
+                
+                # 从列表中查找匹配market_id的项
+                matched_detail = None
+                for detail in order_book_details_list:
+                    if hasattr(detail, 'market_id') and detail.market_id == self.market_index:
+                        matched_detail = detail
+                        break
+                
+                # 如果没有找到匹配的，使用第一个（如果提供了market_id，通常只返回一个）
+                if matched_detail is None and order_book_details_list:
+                    matched_detail = order_book_details_list[0]
+                    self.logger.warning(f"⚠️ 未找到完全匹配的market_id={self.market_index}，使用第一个详情项")
+                
+                if matched_detail:
+                    # 优先使用 size_decimals，如果没有则使用 supported_size_decimals
+                    size_decimals_value = None
+                    if hasattr(matched_detail, 'size_decimals'):
+                        try:
+                            size_decimals_value = matched_detail.size_decimals
+                            if size_decimals_value is not None:
+                                self.size_decimals = size_decimals_value
+                                self.logger.info(f"✓ 从 size_decimals 获取: {self.size_decimals}")
+                        except Exception as e:
+                            self.logger.warning(f"读取 size_decimals 失败: {e}")
+                    
+                    if size_decimals_value is None and hasattr(matched_detail, 'supported_size_decimals'):
+                        try:
+                            size_decimals_value = matched_detail.supported_size_decimals
+                            if size_decimals_value is not None:
+                                self.size_decimals = size_decimals_value
+                                self.logger.info(f"✓ 从 supported_size_decimals 获取: {self.size_decimals}")
+                        except Exception as e:
+                            self.logger.warning(f"读取 supported_size_decimals 失败: {e}")
+                    
+                    # 记录找到的详情信息
+                    self.logger.info(f"订单簿详情: symbol={getattr(matched_detail, 'symbol', 'N/A')}, "
+                                   f"market_id={getattr(matched_detail, 'market_id', 'N/A')}, "
+                                   f"size_decimals={getattr(matched_detail, 'size_decimals', 'N/A')}, "
+                                   f"supported_size_decimals={getattr(matched_detail, 'supported_size_decimals', 'N/A')}")
+                else:
+                    size_decimals_value = None
+                
+                # 如果还是获取不到，根据市场类型使用默认值
+                if size_decimals_value is None:
+                    base_asset = self.market.split('-')[0].upper()
+                    if base_asset == 'BTC':
+                        self.size_decimals = 5  # BTC使用5位小数（100000）
+                    else:
+                        self.size_decimals = 4  # 其他市场默认4位小数（10000）
+                    self.logger.warning(f"⚠️ 无法从API获取size_decimals，根据市场类型使用默认值: {self.size_decimals}")
+                else:
+                    self.logger.info(f"✓ 获取市场 {self.market} (market_index={self.market_index}) 的 size_decimals: {self.size_decimals}")
+            else:
+                # 根据市场类型使用不同的默认值
+                base_asset = self.market.split('-')[0].upper()
+                if base_asset == 'BTC':
+                    self.size_decimals = 5  # BTC使用5位小数（100000）
+                else:
+                    self.size_decimals = 4  # 其他市场默认4位小数（10000）
+                self.logger.warning(f"⚠️ order_book_details返回空结果，根据市场类型使用默认值: {self.size_decimals}")
+        except Exception as e:
+            # 根据市场类型使用不同的默认值
+            base_asset = self.market.split('-')[0].upper()
+            if base_asset == 'BTC':
+                self.size_decimals = 5  # BTC使用5位小数（100000）
+            else:
+                self.size_decimals = 4  # 其他市场默认4位小数（10000）
+            self.logger.error(f"❌ 获取size_decimals失败: {e}，根据市场类型使用默认值: {self.size_decimals}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+        
+        # 关闭临时API客户端
+        await temp_api_client.close()
+        
+        # 如果配置了代理，设置代理
+        if self.proxy_url:
+            self.logger.info(f"为Lighter配置代理: {self.proxy_url}")
+            lighter_config.proxy = self.proxy_url
+            # 如果需要代理认证，可以设置proxy_headers
+            # lighter_config.proxy_headers = {"Proxy-Authorization": "Basic ..."}
+        
+        # 创建SignerClient
         self.lighter_client = lighter.SignerClient(
             url=LIGHTER_URL,
             private_key=self.account_info['api_key_private_key'],
@@ -376,6 +750,22 @@ class AccountTrader:
             api_key_index=int(self.account_info['api_key_index']),
             nonce_management_type=nm.NonceManagerType.API,  # 使用API nonce管理器
         )
+        
+        # 如果配置了代理，替换api_client为带代理配置的客户端
+        if self.proxy_url:
+            api_client = lighter.ApiClient(configuration=lighter_config)
+            self.lighter_client.api_client = api_client
+            self.lighter_client.tx_api = lighter.TransactionApi(api_client)
+            self.lighter_client.order_api = lighter.OrderApi(api_client)
+            
+            # 重新初始化nonce_manager（使用新的api_client）
+            self.lighter_client.nonce_manager = nm.nonce_manager_factory(
+                nonce_manager_type=nm.NonceManagerType.API,
+                account_index=int(self.account_info['account_index']),
+                api_client=api_client,
+                start_api_key=int(self.account_info['api_key_index']),
+                end_api_key=int(self.account_info['api_key_index']),
+            )
         
         # 检查客户端
         err = self.lighter_client.check_client()
@@ -405,15 +795,41 @@ class AccountTrader:
             update_account_status(self.account_name, 'initial_balance_lighter', 0)
             update_account_status(self.account_name, 'current_balance_lighter', 0)
     
+    async def _get_bbo_with_proxy(self, paradex_http_url: str, market: str):
+        """带代理的get_bbo包装函数"""
+        import aiohttp
+        path = f"/bbo/{market}"
+        url = paradex_http_url + path
+        headers = {"Accept": "application/json"}
+        
+        # 获取代理配置
+        proxy_url = None
+        with account_proxy_lock:
+            proxy_url = account_proxy_config.get(self.account_name)
+        
+        async with aiohttp.ClientSession() as session:
+            kwargs = {"headers": headers}
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
+            async with session.get(url, **kwargs) as response:
+                status_code = response.status
+                data = await response.json()
+                if status_code != 200:
+                    self.logger.error(f"Unable to [GET] {path}")
+                    self.logger.error(f"Status Code: {status_code}")
+                    self.logger.error(f"Response Text: {data}")
+                return data
+    
     async def get_current_price(self, order_side=None):
-        """获取当前BTC价格"""
+        """获取当前价格"""
         try:
-            self.logger.info("获取BTC价格...")
+            self.logger.info(f"获取{self.market}价格...")
             
             # 设置超时
             try:
+                # 使用带代理的get_bbo
                 bbo = await asyncio.wait_for(
-                    get_bbo(PARADEX_HTTP_URL, BTC_MARKET),
+                    self._get_bbo_with_proxy(PARADEX_HTTP_URL, self.market),
                     timeout=3.0
                 )
             except asyncio.TimeoutError:
@@ -433,21 +849,21 @@ class AccountTrader:
             
             if price is not None:
                 price_float = float(price)
-                self.logger.info(f"获取BTC价格 ({price_type}): {price_float}")
+                self.logger.info(f"获取{self.market}价格 ({price_type}): {price_float}")
                 return price_float
             
             self.logger.error("无法获取有效价格")
             return None
             
         except Exception as e:
-            self.logger.error(f"获取BTC价格失败: {e}")
+            self.logger.error(f"获取{self.market}价格失败: {e}")
             return None
     
     async def create_limit_order(self, side: OrderSide, size: Decimal, price: Decimal, client_id: str):
         """创建限价单"""
         try:
             order = Order(
-                market=BTC_MARKET,
+                market=self.market,
                 order_type=OrderType.Limit,
                 order_side=side,
                 size=size,
@@ -595,7 +1011,7 @@ class AccountTrader:
                     await asyncio.sleep(0.1)
             
             if not current_price:
-                self.logger.error("多次尝试后仍无法获取BTC价格")
+                self.logger.error(f"多次尝试后仍无法获取{self.market}价格")
                 await asyncio.sleep(0.1)
                 continue
             
@@ -605,9 +1021,9 @@ class AccountTrader:
             
             short_success = await self.create_limit_order(
                 OrderSide.Sell, 
-                ORDER_SIZE, 
+                self.order_size, 
                 short_price,
-                f"{CLIENT_ID_SHORT}-attempt-{attempt + 1}"
+                f"{self.client_id_short}-attempt-{attempt + 1}"
             )
             
             if not short_success:
@@ -649,7 +1065,7 @@ class AccountTrader:
                     await asyncio.sleep(1)
             
             if not current_price:
-                self.logger.error("多次尝试后仍无法获取BTC价格")
+                self.logger.error(f"多次尝试后仍无法获取{self.market}价格")
                 await asyncio.sleep(2)
                 continue
             
@@ -659,9 +1075,9 @@ class AccountTrader:
             
             long_success = await self.create_limit_order(
                 OrderSide.Buy, 
-                ORDER_SIZE, 
+                self.order_size, 
                 long_price,
-                f"{CLIENT_ID_LONG}-attempt-{attempt + 1}"
+                f"{self.client_id_long}-attempt-{attempt + 1}"
             )
             
             if not long_success:
@@ -688,77 +1104,184 @@ class AccountTrader:
         
         for attempt in range(max_retries):
             try:
-                self.logger.info(f"在Lighter创建{'多头' if is_long else '空头'}市价单 (尝试 {attempt + 1}/{max_retries})...")
+                self.logger.info(f"========== 在Lighter创建{'多头' if is_long else '空头'}市价单 (尝试 {attempt + 1}/{max_retries}) ==========")
+                self.logger.info(f"交易对: {self.market}, 市场索引: {self.market_index}, 订单大小: {self.order_size}")
                 
-                # 转换订单大小 (BTC数量转为基础单位)
-                # BTC的最小单位是1e8 (1 BTC = 100,000 最小单位)
-                base_amount = int(ORDER_SIZE * 100000)  # 0.001 BTC = 100,000 最小单位
+                # 转换订单大小 (数量转为基础单位)
+                # 根据市场的size_decimals动态计算base_amount
+                # base_amount = order_size * (10 ** size_decimals)
+                # 例如：如果size_decimals=4，则 0.01 ETH = 0.01 * 10000 = 100 base_amount
+                size_scale = 10 ** self.size_decimals
+                base_amount = int(self.order_size * size_scale)
+                self.logger.info(f"订单大小转换: {self.order_size} {self.market.split('-')[0]} (size_decimals={self.size_decimals}, scale={size_scale}) -> {base_amount} 最小单位")
+                
+                # 验证base_amount是否合理（至少为1）
+                if base_amount < 1:
+                    self.logger.warning(f"订单大小转换后为0或负数，使用最小值1")
+                    base_amount = 1
                 
                 # 使用时间戳和随机数生成唯一索引
                 client_order_index = (int(time.time() * 1000) * 1000 + attempt * 100 + random.randint(1, 99)) % 1000000
+                self.logger.info(f"客户端订单索引: {client_order_index}")
                 
                 # ApiNonceManager会每次从API获取最新nonce，无需手动刷新
                 if hasattr(self.lighter_client.nonce_manager, 'nonce'):
-                    self.logger.info(f"当前nonce: {self.lighter_client.nonce_manager.nonce}")
+                    current_nonce = self.lighter_client.nonce_manager.nonce
+                    self.logger.info(f"当前nonce: {current_nonce}")
+                    self.logger.info(f"账户信息: account_index={self.account_info.get('account_index')}, api_key_index={self.account_info.get('api_key_index')}")
+                else:
+                    self.logger.warning("无法获取nonce信息，nonce_manager没有nonce属性")
                 
                 # 使用限制滑点的市价单函数
-                self.logger.info(f"创建Lighter限制滑点市价单: base_amount={base_amount}, client_order_index={client_order_index}, is_long={is_long}")
+                self.logger.info(f"调用 create_market_order_limited_slippage:")
+                self.logger.info(f"  - market_index: {self.market_index}")
+                self.logger.info(f"  - client_order_index: {client_order_index}")
+                self.logger.info(f"  - base_amount: {base_amount}")
+                self.logger.info(f"  - max_slippage: 0.05 (5%)")
+                self.logger.info(f"  - is_ask: {not is_long} ({'卖出' if not is_long else '买入'})")
                 
                 tx = await self.lighter_client.create_market_order_limited_slippage(
-                    market_index=LIGHTER_BTC_MARKET_INDEX,
+                    market_index=self.market_index,
                     client_order_index=client_order_index,
                     base_amount=base_amount,
                     max_slippage=0.05,  # 最大滑点5%
                     is_ask=not is_long,  # 多头时是bid (买入)，空头时是ask (卖出)
                 )
                 
+                # 详细记录返回结果
+                self.logger.info(f"Lighter API返回结果: {tx}")
+                if tx:
+                    self.logger.info(f"返回结果类型: {type(tx)}")
+                    self.logger.info(f"返回结果长度: {len(tx) if isinstance(tx, (list, tuple)) else 'N/A'}")
+                    if len(tx) >= 2:
+                        self.logger.info(f"响应代码: {tx[1].code if hasattr(tx[1], 'code') else 'N/A'}")
+                        self.logger.info(f"响应详情: {tx[1]}")
+                    if len(tx) >= 3:
+                        self.logger.info(f"错误信息: {tx[2]}")
+                
                 # 检查是否成功
-                if tx and tx[1] and tx[1].code == 200:
-                    self.logger.info(f"Lighter市价单创建成功: {tx}")
+                if tx and len(tx) >= 2 and tx[1] and hasattr(tx[1], 'code') and tx[1].code == 200:
+                    self.logger.info(f"✓ Lighter市价单创建成功！")
+                    self.logger.info(f"完整返回结果: {tx}")
                     return True
                 else:
                     error_msg = tx[2] if tx and len(tx) > 2 else "Unknown error"
-                    self.logger.warning(f"Lighter市价单创建返回非成功状态: {error_msg}")
+                    error_code = tx[1].code if tx and len(tx) >= 2 and hasattr(tx[1], 'code') else "N/A"
                     
-                    if "invalid nonce" in str(error_msg):
-                        self.logger.warning(f"Nonce错误！后端期望的nonce与本地不匹配")
-                        self.logger.warning(f"  - API Key: {self.account_info.get('api_key_index', 0)}")
-                        self.logger.warning(f"  - Account: {self.account_info.get('account_index', 0)}")
+                    # 尝试从错误信息中提取错误代码
+                    error_code_extracted = None
+                    error_msg_clean = str(error_msg)
+                    import re
+                    code_match = re.search(r'code=(\d+)', error_msg_clean)
+                    if code_match:
+                        error_code_extracted = int(code_match.group(1))
+                        message_match = re.search(r"message='([^']+)'", error_msg_clean)
+                        if message_match:
+                            error_msg_clean = message_match.group(1)
+                    
+                    # 使用提取的错误代码（如果存在）
+                    if error_code_extracted is not None:
+                        error_code = error_code_extracted
+                    
+                    self.logger.error(f"✗ Lighter市价单创建失败！")
+                    self.logger.error(f"  错误代码: {error_code}")
+                    self.logger.error(f"  错误信息: {error_msg_clean}")
+                    if error_code_extracted != error_code:
+                        self.logger.error(f"  原始错误信息: {error_msg}")
+                    self.logger.error(f"  完整响应: {tx}")
+                    
+                    # 地区限制错误（20558）- 不应该重试
+                    if error_code == 20558 or "restricted jurisdiction" in str(error_msg).lower():
+                        self.logger.error(f"")
+                        self.logger.error(f"  ⚠️  地区限制错误！")
+                        self.logger.error(f"  当前IP地址所在的地区无法访问Lighter服务。")
+                        self.logger.error(f"  解决方案：")
+                        self.logger.error(f"  1. 使用VPN或代理服务器连接到允许的地区")
+                        self.logger.error(f"  2. 联系Lighter支持了解详情: https://lighter.xyz/terms")
+                        self.logger.error(f"  3. 检查网络连接和代理设置")
+                        self.logger.error(f"")
+                        # 地区限制错误不应该重试，直接返回False
+                        return False
+                    
+                    # Nonce错误 - 可以重试
+                    if "invalid nonce" in str(error_msg).lower() or error_code == "N/A" and "nonce" in str(error_msg).lower():
+                        self.logger.error(f"  ⚠️  Nonce错误！后端期望的nonce与本地不匹配")
+                        self.logger.error(f"  - API Key索引: {self.account_info.get('api_key_index', 0)}")
+                        self.logger.error(f"  - 账户索引: {self.account_info.get('account_index', 0)}")
                         
                         # 等待更长的时间让pending交易完成，并强制刷新nonce
-                        self.logger.warning(f"等待pending交易完成（10秒）...")
-                        api_key_idx = int(self.account_info.get('api_key_index', 0))
-                        self.lighter_client.nonce_manager.hard_refresh_nonce(api_key_idx)
-                        await asyncio.sleep(10)  # 等待10秒
-                        continue
-                    else:
-                        return False
+                        if attempt < max_retries - 1:
+                            self.logger.warning(f"  等待pending交易完成（10秒）后重试...")
+                            api_key_idx = int(self.account_info.get('api_key_index', 0))
+                            self.lighter_client.nonce_manager.hard_refresh_nonce(api_key_idx)
+                            await asyncio.sleep(10)  # 等待10秒
+                            continue
+                        else:
+                            self.logger.error(f"  已达到最大重试次数，停止重试")
+                            return False
+                    
+                    # 其他错误 - 根据错误类型决定是否重试
+                    if attempt < max_retries - 1:
+                        # 某些临时错误可以重试
+                        retryable_errors = [500, 502, 503, 504, 429]  # 服务器错误和限流错误
+                        if error_code in retryable_errors or "temporary" in str(error_msg).lower():
+                            self.logger.warning(f"  临时错误，等待后重试...")
+                            await asyncio.sleep(2)
+                            continue
+                    
+                    # 不可重试的错误或已达到最大重试次数
+                    if attempt == max_retries - 1:
+                        self.logger.error(f"  已达到最大重试次数，停止重试")
+                    return False
                 
             except Exception as e:
                 error_str = str(e)
-                self.logger.error(f"创建Lighter市价单失败 (尝试 {attempt + 1}): {error_str}")
+                self.logger.error(f"✗ 创建Lighter市价单异常 (尝试 {attempt + 1}/{max_retries}): {error_str}")
+                self.logger.error(f"  异常类型: {type(e).__name__}")
+                import traceback
+                self.logger.error(f"  完整堆栈:")
+                self.logger.error(traceback.format_exc())
                 
-                if "invalid nonce" in error_str or "nonce" in error_str.lower():
+                # 检查是否是地区限制错误
+                if "20558" in error_str or "restricted jurisdiction" in error_str.lower():
+                    self.logger.error(f"")
+                    self.logger.error(f"  ⚠️  地区限制错误！")
+                    self.logger.error(f"  当前IP地址所在的地区无法访问Lighter服务。")
+                    self.logger.error(f"  解决方案：")
+                    self.logger.error(f"  1. 使用VPN或代理服务器连接到允许的地区")
+                    self.logger.error(f"  2. 联系Lighter支持了解详情: https://lighter.xyz/terms")
+                    self.logger.error(f"  3. 检查网络连接和代理设置")
+                    self.logger.error(f"")
+                    # 地区限制错误不应该重试，直接返回False
+                    return False
+                
+                # Nonce错误 - 可以重试
+                if "invalid nonce" in error_str.lower() or "nonce" in error_str.lower():
                     if attempt < max_retries - 1:
-                        self.logger.warning(f"Nonce错误！等待pending交易完成...")
+                        self.logger.warning(f"  ⚠️  Nonce相关错误，等待pending交易完成...")
                         
                         # 等待pending交易完成
                         await asyncio.sleep(3)
                         continue
                 
+                # 其他错误
                 if attempt == max_retries - 1:
-                    import traceback
-                    traceback.print_exc()
+                    self.logger.error(f"  最后一次尝试失败，停止重试")
                 
                 return False
         
-        self.logger.error(f"Lighter市价单创建在{max_retries}次尝试后失败")
+        self.logger.error(f"✗ Lighter市价单创建在{max_retries}次尝试后全部失败")
         return False
     
     async def get_lighter_positions(self):
         """获取Lighter当前持仓"""
         try:
             self.logger.info("获取Lighter当前持仓...")
+            
+            # 检查lighter_client是否已初始化
+            if self.lighter_client is None:
+                self.logger.warning("Lighter客户端未初始化，无法获取持仓")
+                return []
             
             # 创建AccountApi实例
             from lighter.api.account_api import AccountApi
@@ -772,19 +1295,37 @@ class AccountTrader:
             
             self.logger.info(f"账户信息: {account_info}")
             
+            # 从Paradex market名称提取基础资产（如BTC-USD-PERP -> BTC）
+            base_asset = self.market.split('-')[0].upper()
+            
             # 从日志可以看到账户信息在 accounts 数组中
             if hasattr(account_info, 'accounts') and account_info.accounts:
                 account = account_info.accounts[0]  # 取第一个账户
                 if hasattr(account, 'positions') and account.positions:
                     self.logger.info(f"总持仓数: {len(account.positions)}")
-                    btc_positions = []
+                    market_positions = []
                     for i, pos in enumerate(account.positions):
-                        self.logger.info(f"持仓 {i}: market_id={getattr(pos, 'market_id', 'N/A')}, position={getattr(pos, 'position', 'N/A')}, sign={getattr(pos, 'sign', 'N/A')}")
-                        if hasattr(pos, 'market_id') and pos.market_id == LIGHTER_BTC_MARKET_INDEX:
-                            btc_positions.append(pos)
-                            self.logger.info(f"找到BTC持仓: position={pos.position}, sign={pos.sign}")
-                    self.logger.info(f"找到 {len(btc_positions)} 个BTC持仓")
-                    return btc_positions
+                        market_id = getattr(pos, 'market_id', None)
+                        symbol = getattr(pos, 'symbol', '').upper()
+                        position = getattr(pos, 'position', 'N/A')
+                        sign = getattr(pos, 'sign', 'N/A')
+                        
+                        self.logger.info(f"持仓 {i}: market_id={market_id}, symbol={symbol}, position={position}, sign={sign}")
+                        
+                        # 精确匹配：只匹配symbol完全相等的持仓（避免ETH匹配到ETHFI）
+                        if hasattr(pos, 'market_id') and hasattr(pos, 'symbol'):
+                            if symbol == base_asset and pos.market_id == self.market_index:
+                                market_positions.append(pos)
+                                self.logger.info(f"✓ 找到精确匹配的{self.market}持仓: market_id={pos.market_id}, symbol={symbol}, position={pos.position}, sign={pos.sign}")
+                            elif symbol == base_asset:
+                                # symbol匹配但market_id不匹配，记录警告
+                                self.logger.warning(f"⚠️  symbol={symbol} 匹配，但market_id={pos.market_id}与配置的market_index={self.market_index}不一致")
+                            elif pos.market_id == self.market_index:
+                                # market_id匹配但symbol不匹配，记录警告
+                                self.logger.warning(f"⚠️  market_id={pos.market_id} 匹配，但symbol={symbol}与预期的{base_asset}不一致")
+                    
+                    self.logger.info(f"找到 {len(market_positions)} 个{self.market}持仓（精确匹配）")
+                    return market_positions
                 else:
                     self.logger.info("账户没有持仓数据")
                     return []
@@ -804,22 +1345,23 @@ class AccountTrader:
                 return False
             
             # position字段是BTC单位的字符串（如'0.00100'），需要转换为最小单位
-            position_btc = abs(float(str(position.position)))  # 转换为BTC数量
-            position_size = int(position_btc * 100000)  # 转换为最小单位
+            position_amount = abs(float(str(position.position)))  # 转换为数量
+            position_size = int(position_amount * 100000)  # 转换为最小单位
             # 如果有正仓位但换算后为0，兜底为1个最小单位
-            if position_btc > 0 and position_size == 0:
+            if position_amount > 0 and position_size == 0:
                 position_size = 1
             is_long = position.sign == 1  # sign: 1 for Long, -1 for Short
             close_is_ask = is_long  # 如果是多头，需要卖出（ask）；如果是空头，需要买入（bid）
             
-            self.logger.info(f"平仓: {'多头' if is_long else '空头'}, 数量: {position_btc} BTC ({position_size} 最小单位)")
+            market_symbol = self.market.split('-')[0]
+            self.logger.info(f"平仓: {'多头' if is_long else '空头'}, 数量: {position_amount} {market_symbol} ({position_size} 最小单位)")
             
             # 使用市价单平仓（reduce_only=True 防止误加仓）
             base_amount = position_size
             client_order_index = (int(time.time() * 1000) * 1000 + random.randint(1, 99)) % 1000000
             
             tx = await self.lighter_client.create_market_order_limited_slippage(
-                market_index=LIGHTER_BTC_MARKET_INDEX,
+                market_index=self.market_index,
                 client_order_index=client_order_index,
                 base_amount=base_amount,
                 max_slippage=0.05,
@@ -861,17 +1403,17 @@ class AccountTrader:
             self.logger.info("获取Paradex当前持仓...")
             positions = await fetch_positions(PARADEX_HTTP_URL, self.jwt_token)
             
-            # 过滤BTC持仓
-            btc_positions = []
+            # 过滤当前市场持仓
+            market_positions = []
             for pos in positions:
-                if pos.get('market') == BTC_MARKET:
-                    btc_positions.append(pos)
+                if pos.get('market') == self.market:
+                    market_positions.append(pos)
             
-            if btc_positions:
-                self.logger.info(f"找到 {len(btc_positions)} 个BTC持仓")
+            if market_positions:
+                self.logger.info(f"找到 {len(market_positions)} 个{self.market}持仓")
             else:
-                self.logger.info("没有BTC持仓")
-            return btc_positions
+                self.logger.info(f"没有{self.market}持仓")
+            return market_positions
             
         except Exception as e:
             self.logger.error(f"获取Paradex持仓失败: {e}")
@@ -905,7 +1447,7 @@ class AccountTrader:
             
             # 创建市价单平仓
             order = Order(
-                market=BTC_MARKET,
+                market=self.market,
                 order_type=OrderType.Market,
                 order_side=order_side,
                 size=Decimal(str(abs(size))),
@@ -1007,23 +1549,23 @@ class AccountTrader:
             paradex_positions = await self.get_paradex_positions()
             lighter_positions = await self.get_lighter_positions()
             
-            # 提取BTC持仓
-            paradex_btc_pos = None
+            # 提取当前市场持仓
+            paradex_market_pos = None
             for pos in paradex_positions:
-                if pos.get('market') == BTC_MARKET:
-                    paradex_btc_pos = pos
+                if pos.get('market') == self.market:
+                    paradex_market_pos = pos
                     break
             
-            lighter_btc_pos = None
+            lighter_market_pos = None
             if lighter_positions and len(lighter_positions) > 0:
-                lighter_btc_pos = lighter_positions[0]
+                lighter_market_pos = lighter_positions[0]
             
             # 解析持仓数量
             paradex_size = 0.0
             paradex_is_short = False
-            if paradex_btc_pos:
+            if paradex_market_pos:
                 try:
-                    raw_size = paradex_btc_pos.get('size', 0)
+                    raw_size = paradex_market_pos.get('size', 0)
                     paradex_size = abs(float(raw_size))
                     paradex_is_short = float(raw_size) < 0
                 except Exception as e:
@@ -1032,12 +1574,12 @@ class AccountTrader:
             
             lighter_size = 0.0
             lighter_is_long = False
-            if lighter_btc_pos:
+            if lighter_market_pos:
                 try:
-                    position_value = getattr(lighter_btc_pos, 'position', None)
-                    sign_value = getattr(lighter_btc_pos, 'sign', None)
+                    position_value = getattr(lighter_market_pos, 'position', None)
+                    sign_value = getattr(lighter_market_pos, 'sign', None)
                     if position_value is not None:
-                        # position字段已经是BTC单位的字符串，直接转换为float
+                        # position字段已经是单位的字符串，直接转换为float
                         lighter_size = abs(float(str(position_value)))
                         lighter_is_long = (sign_value == 1) if sign_value is not None else False
                 except Exception as e:
@@ -1075,64 +1617,66 @@ class AccountTrader:
             # 获取两边持仓
             self.logger.info("正在获取Paradex持仓...")
             paradex_positions = await self.get_paradex_positions()
-            self.logger.info(f"Paradex持仓查询结果: {len(paradex_positions)} 个BTC持仓")
+            self.logger.info(f"Paradex持仓查询结果: {len(paradex_positions)} 个{self.market}持仓")
             
             self.logger.info("正在获取Lighter持仓...")
             lighter_positions = await self.get_lighter_positions()
-            self.logger.info(f"Lighter持仓查询结果: {len(lighter_positions)} 个BTC持仓")
+            self.logger.info(f"Lighter持仓查询结果: {len(lighter_positions)} 个{self.market}持仓")
             
-            # 提取BTC持仓
-            paradex_btc_pos = None
+            # 提取当前市场持仓
+            paradex_market_pos = None
             for pos in paradex_positions:
-                if pos.get('market') == BTC_MARKET:
-                    paradex_btc_pos = pos
-                    self.logger.info(f"找到Paradex BTC持仓: {pos}")
+                if pos.get('market') == self.market:
+                    paradex_market_pos = pos
+                    self.logger.info(f"找到Paradex {self.market}持仓: {pos}")
                     break
             
-            lighter_btc_pos = None
+            lighter_market_pos = None
             if lighter_positions and len(lighter_positions) > 0:
-                lighter_btc_pos = lighter_positions[0]  # 取第一个BTC持仓
-                self.logger.info(f"找到Lighter BTC持仓对象: position={getattr(lighter_btc_pos, 'position', 'N/A')}, sign={getattr(lighter_btc_pos, 'sign', 'N/A')}")
+                lighter_market_pos = lighter_positions[0]  # 取第一个持仓
+                self.logger.info(f"找到Lighter {self.market}持仓对象: position={getattr(lighter_market_pos, 'position', 'N/A')}, sign={getattr(lighter_market_pos, 'sign', 'N/A')}")
             else:
-                self.logger.info("Lighter持仓列表为空或没有BTC持仓")
+                self.logger.info(f"Lighter持仓列表为空或没有{self.market}持仓")
+            
+            market_symbol = self.market.split('-')[0]
             
             # 解析持仓数量
             paradex_size = 0.0
             paradex_is_short = False
-            if paradex_btc_pos:
+            if paradex_market_pos:
                 try:
-                    raw_size = paradex_btc_pos.get('size', 0)
+                    raw_size = paradex_market_pos.get('size', 0)
                     paradex_size = abs(float(raw_size))
                     paradex_is_short = float(raw_size) < 0
-                    self.logger.info(f"Paradex持仓: {'空头' if paradex_is_short else '多头'} {paradex_size} BTC (原始值: {raw_size})")
+                    self.logger.info(f"Paradex持仓: {'空头' if paradex_is_short else '多头'} {paradex_size} {market_symbol} (原始值: {raw_size})")
                 except Exception as e:
-                    self.logger.error(f"解析Paradex持仓数量失败: {e}, 持仓数据: {paradex_btc_pos}")
+                    self.logger.error(f"解析Paradex持仓数量失败: {e}, 持仓数据: {paradex_market_pos}")
                     paradex_size = 0.0
             else:
-                self.logger.info("Paradex无BTC持仓")
+                self.logger.info(f"Paradex无{self.market}持仓")
             
             lighter_size = 0.0
             lighter_is_long = False
-            if lighter_btc_pos:
+            if lighter_market_pos:
                 try:
-                    position_value = getattr(lighter_btc_pos, 'position', None)
-                    sign_value = getattr(lighter_btc_pos, 'sign', None)
+                    position_value = getattr(lighter_market_pos, 'position', None)
+                    sign_value = getattr(lighter_market_pos, 'sign', None)
                     self.logger.info(f"Lighter持仓原始值: position={position_value}, sign={sign_value}")
                     
                     if position_value is not None:
-                        # position字段已经是BTC单位的字符串，直接转换为float
+                        # position字段已经是单位的字符串，直接转换为float
                         lighter_size = abs(float(str(position_value)))
                         lighter_is_long = (sign_value == 1) if sign_value is not None else False
-                        self.logger.info(f"Lighter持仓: {'多头' if lighter_is_long else '空头'} {lighter_size} BTC")
+                        self.logger.info(f"Lighter持仓: {'多头' if lighter_is_long else '空头'} {lighter_size} {market_symbol}")
                     else:
                         self.logger.warning("Lighter持仓position属性为None")
                 except Exception as e:
-                    self.logger.error(f"解析Lighter持仓数量失败: {e}, 持仓对象: {lighter_btc_pos}")
+                    self.logger.error(f"解析Lighter持仓数量失败: {e}, 持仓对象: {lighter_market_pos}")
                     import traceback
                     traceback.print_exc()
                     lighter_size = 0.0
             else:
-                self.logger.info("Lighter无BTC持仓")
+                self.logger.info(f"Lighter无{self.market}持仓")
             
             # 更新持仓信息到UI状态
             paradex_position_str = ""
@@ -1162,18 +1706,18 @@ class AccountTrader:
                 return True, paradex_btc_pos, lighter_btc_pos
             elif not paradex_is_short and not lighter_is_long and abs(paradex_size - lighter_size) < tolerance:
                 # Paradex多头 + Lighter空头
-                self.logger.info(f"✓ 持仓对等: Paradex多头 {paradex_size} BTC = Lighter空头 {lighter_size} BTC")
-                return True, paradex_btc_pos, lighter_btc_pos
+                self.logger.info(f"✓ 持仓对等: Paradex多头 {paradex_size} {market_symbol} = Lighter空头 {lighter_size} {market_symbol}")
+                return True, paradex_market_pos, lighter_market_pos
             elif paradex_is_short and lighter_is_long and abs(paradex_size - lighter_size) < tolerance:
                 # Paradex空头 + Lighter多头
-                self.logger.info(f"✓ 持仓对等: Paradex空头 {paradex_size} BTC = Lighter多头 {lighter_size} BTC")
-                return True, paradex_btc_pos, lighter_btc_pos
+                self.logger.info(f"✓ 持仓对等: Paradex空头 {paradex_size} {market_symbol} = Lighter多头 {lighter_size} {market_symbol}")
+                return True, paradex_market_pos, lighter_market_pos
             else:
                 self.logger.warning(f"✗ 持仓不对等!")
-                self.logger.warning(f"  Paradex: {'空头' if paradex_is_short else ('多头' if paradex_size > 0 else '无')} {paradex_size} BTC")
-                self.logger.warning(f"  Lighter: {'多头' if lighter_is_long else ('空头' if lighter_size > 0 else '无')} {lighter_size} BTC")
-                self.logger.warning(f"  数量差异: {abs(paradex_size - lighter_size)} BTC (允许误差: {tolerance} BTC)")
-                return False, paradex_btc_pos, lighter_btc_pos
+                self.logger.warning(f"  Paradex: {'空头' if paradex_is_short else ('多头' if paradex_size > 0 else '无')} {paradex_size} {market_symbol}")
+                self.logger.warning(f"  Lighter: {'多头' if lighter_is_long else ('空头' if lighter_size > 0 else '无')} {lighter_size} {market_symbol}")
+                self.logger.warning(f"  数量差异: {abs(paradex_size - lighter_size)} {market_symbol} (允许误差: {tolerance} {market_symbol})")
+                return False, paradex_market_pos, lighter_market_pos
                 
         except Exception as e:
             self.logger.error(f"检查持仓对等性失败: {e}")
@@ -1515,9 +2059,10 @@ def main():
     
     logging.info(f"找到 {len(accounts)} 个账户配置")
     
-    # 启动状态监控线程
+    # 启动UI状态监控线程
     monitor_thread = threading.Thread(target=run_status_monitor, daemon=True)
     monitor_thread.start()
+    logging.info("UI状态监控已启动，每2秒刷新一次")
     
     # 为每个账户创建线程
     threads = []
@@ -1548,7 +2093,7 @@ def main():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("多线程BTC交易脚本")
+    print("多线程交易脚本")
     print("=" * 60)
     
     main()

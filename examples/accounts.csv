@@ -1,1 +1,4 @@
-account_index,api_key_index,api_key_private_key,paradex_eth_key,description,wait_time
+account_index,api_key_index,api_key_private_key,paradex_eth_key,description,wait_time,market,order_size,proxy_url
+15892,4,1913ded3803646af111086a075a7cc6fa68d83e,0x2c1a16c3fd495f59d94790607d2,BTC账户,20,BTC-USD-PERP,0.001,socks5://efwzmm:630jp6to@82.22.73.244:7450
+3156,3,6ac11fe98dccd78f93d2fadbc2b363f69415584146,0x082fd5384ea74539f452cdf3d0,ETH账户,100,ETH-USD-PERP,0.01,socks5://efwmm:630dxp6to@82.22.73.244:7450
+31625,2,c633f829051daf92f4e21094d3a941,0x882298a8247c929093a70236d2c8d0,SOL账户,30,SOL-USD-PERP,0.1,socks5://efzmm:630p6to@82.22.73.244:7450
